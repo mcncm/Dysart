@@ -1,6 +1,6 @@
 # DySART (Dynamic Settings and Retrieval Toolkit) &mdash; enabling introspection for EQuS
 
-> **N.b. This repository has migrated to** [https://github.com/qmit/dysart](https://github.com/qmit/dysart)
+> **N.b. This repository has migrated to** [https://github.com/qmit/dysart](https://github.com/qmit/dysart).
 > **It is no longer actively maintained on this page.**
 
 I think the picture of what this package is supposed to do is _starting_ to
