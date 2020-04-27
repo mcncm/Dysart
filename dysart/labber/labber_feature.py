@@ -24,7 +24,7 @@ from Labber import ScriptTools as st
 from dysart.labber.labber_serialize import load_labber_scenario_as_dict
 from dysart.labber.labber_serialize import save_labber_scenario_from_dict
 from dysart.labber.labber_util import no_recorded_result
-from dysart.feature import Feature, CallRecord, refresh
+from dysart.feature import Feature, CallRecord, ExpirationStatus, refresh
 import dysart.messages.messages as messages
 from dysart.messages.errors import UnsupportedPlatformError
 import toplevel.conf as conf
@@ -77,7 +77,6 @@ class result:
             feature = args[0] # TODO: is this good practice?
 
             index = kwargs.get('index') or -1  # default last entry
-            hist_len = len(feature.log_history)
             # Ensure that `results` is long enough.
             if index < 0:
                 index = len(feature.log_history) + index
@@ -86,8 +85,7 @@ class result:
 
             try:
                 return_value = feature.results[index][fn.__name__]
-            except:
-                # TODO: Pokemon exception handling
+            except KeyError:  # Results of this function at this index not cached!
                 return_value = fn(*args, **kwargs)
                 feature.results[index][fn.__name__] = return_value
                 feature.save()
@@ -141,14 +139,13 @@ class LogHistory:
                     raise IndexError('Labber logfile with index {} cannot be found'.format(index))
                 if log_path not in self.log_cache:
                     log_file = Labber.LogFile(self.log_path(index))
-                    self.log_cache[log_path] = []
-                    for i in range(log_file.getNumberOfEntries()):
-                        self.log_cache[log_path].append(log_file.getEntry(i))
-
+                    self.log_cache[log_path] = log_file
                 return self.log_cache[log_path]
+
         elif type(index) == slice:
             # TODO is a less naive implementation possible here?
             # Probably should do some bounds checking, at least.
+            # TODO test this, e.g. with slice [:]--it is known not to work.
             return [self[i] for i in range(index.start, index.stop, index.step)]
         else:
             raise TypeError
@@ -308,18 +305,12 @@ class LabberFeature(Feature):
         for key in kwargs:
             self.set_value(key, kwargs[key])
 
-        # Make RPC to Labber!
-        # set the input file.
+        # Make call to Labber!
         self.labber_input_file = self.emit_labber_input_file()
         self.labber_output_file = self.log_history.next_log_path()
         self.config.performMeasurement()
         # Clean up: tempfile no longer needed.
         os.unlink(self.labber_input_file)
-
-        # Raw data is now in output_file. Load it into self.data.
-        # TODO do these *do** anything?
-        log_name = os.path.split(self.labber_output_file)[-1]
-        log_file = Labber.LogFile(self.labber_output_file)
 
     def all_results(self, index=-1) -> dict:
         """Returns a dict containing all the result values, even if they haven't been
@@ -369,15 +360,14 @@ class LabberFeature(Feature):
         elif isinstance(value, np.ndarray):
             canonicalized_value = list(value)
         elif isinstance(value, tuple):
-            canonicalized_value = list(np.linspace(*value))
+            canonicalized_value = value
         elif isinstance(value, (int, float, complex)):
             canonicalized_value = value
-        #    self.config.updateValue(label, canonizalized_value)
+        #    self.config.updateValue(label, canonicalized_value)
         else:
             Exception("I don't know what to do with this value")
 
         self.template_diffs[label] = canonicalized_value
-        #self.set_expired(True)
 
     def merge_configs(self):
         """TODO write a real docstring here
@@ -388,10 +378,15 @@ class LabberFeature(Feature):
         new_config = copy.deepcopy(self.template)
         for diff_key in self.template_diffs:
             vals = self.template_diffs[diff_key]
-            channel = [c for c in new_config['step_channels'] if
+            channels = [c for c in new_config['step_channels'] if
                        c['channel_name'] == diff_key]
-            channel = [{}] if not channel else channel[0]
+            channel = {} if not channels else channels[0]
+            # Resolve a 3-tuple as (start, stop, n_pts).
+            # For now, let's *only* handle linear interpolation
             if isinstance(vals, tuple):
+                # It's wrapped in a list: if our assumption that it's length 1
+                # is wrong, let us know. We'll pull in Antti's code to do this
+                # correctly.
                 items = channel['step_items'][0]
                 items['start'] = vals[0]
                 items['stop'] = vals[1]
@@ -458,7 +453,11 @@ class LabberFeature(Feature):
         TODO: introspect in call record history for detailed expiration info.
         For now, simply checks if there exists a named output file.
         """
-        return no_recorded_result(self) or self.manual_expiration_switch
+        expired = self.manual_expiration_switch
+        expired |= no_recorded_result(self)
+        if hasattr(self, '__expiration_hook__'):
+            expired |= self.__expiration_hook__() == ExpirationStatus.EXPIRED
+        return expired
 
 
 class LabberCall(CallRecord):

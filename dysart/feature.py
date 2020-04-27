@@ -13,6 +13,7 @@ the last person who touched the system.
 """
 
 import datetime as dt
+import enum
 from functools import wraps
 import getpass
 import hashlib
@@ -24,7 +25,11 @@ import mongoengine as me
 
 import dysart.messages.messages as messages
 
-CALLRECORD_UID_LEN = 40
+
+class ExpirationStatus(enum.Enum):
+    FRESH = enum.auto()
+    EXPIRED = enum.auto()
+
 
 def refresh(fn):
     """Decorator that flags a method as having dependencies and possibly requiring
@@ -79,54 +84,45 @@ def refresh(fn):
             stack_level=stack_level,
             user=getpass.getuser(),
             hostname=socket.gethostname()
-        ) 
-
-        record.start_time = dt.datetime.now()
+        )
+        record.setup()
 
         # First run the optional pre-hook, if any
-        pre_hook = getattr(feature, '__pre_hook__', None)
-        if pre_hook is not None:
-            pre_hook(record)
-
-        # TODO: factor this chunk out
-        # is_stale tracks whether we need to update this node
-        is_stale = False
-        # if this call recurses, recurse on ancestors.
-        if feature.is_recursive():
-            for parent in feature.parents.values():
-                # Call parent to refresh recursively; increment stack depth
-                parent_is_stale = parent.touch(initiating_call=record, is_stale=0)
-                is_stale |= parent_is_stale
-        # If stale for some other reason, also flag to be updated.
-        is_stale |= feature.expired(call_record=None)
-        is_stale |= feature.manual_expiration_switch
-        # If this line is in a later place, __call__ is called twice. You need
-        # to understand why.
-        feature.manual_expiration_switch = False
-
-        # Call the update-self method, the reason for this wrapper's existence
-        if is_stale:
-            feature(initiating_call=initiating_call)
-
-        # Update staleness parameter in case it was passed in with the function
-        # TODO: this currently only exists for the benefit of Feature.touch().
-        # If that method is removed, consider getting rid of this snippet, too.
-        if 'is_stale' in kwargs:
-            kwargs['is_stale'] = is_stale
-
-        # Call the requested function!
-        return_value = fn(*args, **kwargs)
-        # Save any changes to the database
-        # feature.manual_expiration_switch = False
-        feature.save()
-        
-        # Finally, run the optional post-hook, if any
-        post_hook = getattr(feature, '__post_hook__', None)
-        if post_hook is not None:
-            post_hook(record)
+        if hasattr(feature, '__pre_hook__'):
+            feature.__pre_hook__(record)
             
-        record.stop_time = dt.datetime.now()
-        record.save()
+        try:
+            # Call the Feature--this is the reason for this wrapper's existence
+            # TODO note that `is_stale` sounds like it just returns a boolean--
+            # but it has very significant side-effects. This is probably a
+            # symptom of poor design.
+            is_stale = feature.is_stale(record)
+            if is_stale:
+                feature(initiating_call=initiating_call)
+            # Update staleness parameter in case it was passed in with the function
+            # TODO: this currently only exists for the benefit of Feature.touch().
+            # That is *so* complex and unintuitive. What spaghetti code.
+            # If that method is removed, consider getting rid of this snippet, too.
+            if 'is_stale' in kwargs:
+                kwargs['is_stale'] = is_stale
+            # Call the requested function!
+            return_value = fn(*args, **kwargs)
+            
+            # Run the optional validation hook, if any 
+            if hasattr(feature, '__validation_hook__'):
+                feature.__validation_hook__(record, return_value)
+            
+            # Save any changes to the database
+            # feature.manual_expiration_switch = False
+            feature.save()
+            status = CallStatus.DONE
+        except Exception as e:
+            status = CallStatus.FAILED
+        finally:
+            record.conclude(status)
+            # Finally, run the optional post-hook, if any
+            if hasattr(feature, '__post_hook__'):
+                feature.__post_hook__(record)
 
         # Finally, pass along return value of fn
         return return_value
@@ -167,7 +163,6 @@ class Feature(me.Document):
         """
         return ''
 
-
     def __str__(self):
         """should report its name, most-derived (?) type, parents, and names and
         expiration statuses thereof.
@@ -183,7 +178,6 @@ class Feature(me.Document):
         status = self._status()
         if status:
             s += '\n' + status
-
         return s
 
     def tree(self) -> None:
@@ -212,7 +206,7 @@ class Feature(me.Document):
         for prop in self._properties():
             messages.pprint_func(prop, self.__class__.__dict__[prop].__doc__)
 
-    def call_records(self, **kwargs) -> list:
+    def call_records(self, **kwargs) -> me.QuerySet:
         """Return a list of CallRecords associated with this Feature.
 
         """
@@ -222,7 +216,7 @@ class Feature(me.Document):
             # TODO: use a standard error-reporting method in the messages module.
             print("Invalid call record field: allowedfields are TODO", sys.stderr)
 
-    def pprintt_call_records(self) -> list:
+    def pprint_call_records(self) -> list:
         """Pretty-print a list of CallRecords associated with this Feature
         """
         for record in self.call_records():
@@ -239,6 +233,22 @@ class Feature(me.Document):
         """
         return
 
+    def is_stale(self, record):
+        """A pretty weird internal method
+        """
+        is_stale = False
+        # if this call recurses, recurse on ancestors.
+        for parent in self.parents.values():
+            # Call parent to refresh recursively; increment stack depth
+            is_stale |= parent.touch(initiating_call=record, is_stale=False)
+        # If stale for some other reason, also flag to be updated.
+        is_stale |= self.expired(call_record=None)
+        is_stale |= self.manual_expiration_switch
+        # If this line is in a later place, __call__ is called twice. You need
+        # to understand why.
+        self.manual_expiration_switch = False
+        return is_stale
+
     @refresh
     def touch(self, initiating_call=None, is_stale=False) -> bool:
         """Manually refresh the feature without doing anything else. This method has a
@@ -251,9 +261,12 @@ class Feature(me.Document):
         return is_stale
 
     def expired(self, call_record: "CallRecord" = None) -> object:
-        """Check for feature expiration. By default, everything is a twinkie.
+        """Check for feature expiration.
         """
-        return self.manual_expiration_switch
+        expired = self.manual_expiration_switch
+        if hasattr(self, '__expiration_hook__'):
+            expired |= self.__expiration_hook__() == ExpirationStatus.EXPIRED
+        return expired
 
     def set_expired(self, is_expired: bool = True) -> None:
         """Provide an interface to manually set the expiration state of a feature.
@@ -263,13 +276,6 @@ class Feature(me.Document):
 
     def update(self):
         pass
-
-    def is_recursive(self) -> bool:
-        """Does dependency-checking recurse on this feature? By default, yes.
-        Even though this does nothing now, I'm leaving it here to indicate that
-        a feature might take its place in the future.
-        """
-        return True
 
     @property
     def parents(self):
@@ -302,6 +308,14 @@ class Feature(me.Document):
         self.save()
 
 
+class CallStatus(enum.Enum):
+    START = enum.auto()
+    DONE = enum.auto()
+    FAILED = enum.auto()
+    HALTED = enum.auto()
+    WARNING = enum.auto()
+
+
 class CallRecord(me.Document):
     """
     TODO CallRecord docstring
@@ -312,10 +326,7 @@ class CallRecord(me.Document):
 
     meta = {'allow_inheritance': True}
 
-    # Exit codes
-    DONE = 'DONE'
-    FAILED = 'FAILED'
-    WARNING = 'WARNING'
+    UUID_LEN = 40
 
     # Which attributes are included in self.__str__()?
     printed_attrs = ['feature',
@@ -330,12 +341,12 @@ class CallRecord(me.Document):
     stack_level = me.IntField(default=0)
     feature = me.ReferenceField(Feature, required=True)
     method = me.StringField(max_length=80)
-    uid = me.StringField(default='', max_length=CALLRECORD_UID_LEN, required=True, primary_key=True)
+    uuid = me.StringField(default='', max_length=UUID_LEN, required=True, primary_key=True)
     start_time = me.DateTimeField()
     stop_time = me.DateTimeField()
     user = me.StringField(max_length=255)
     hostname = me.StringField(max_length=255)
-    exit_status = me.StringField(max_length=12, default='DONE')
+    exit_status = me.StringField(max_length=16)
     info = me.StringField(default='')
 
     def __init__(self, *args, **kwargs):
@@ -343,22 +354,38 @@ class CallRecord(me.Document):
         args
         """
         super().__init__(*args, **kwargs)
+        
+    def __setattr__(self, key, value):
+        """The `exit_status` field should be a string, so handle this
+        case in a special way: accept only CallStatus enums, but
+        """
+        if key == 'exit_status' and type(value) == CallStatus:
+            super().__setattr__(key, value.name)
+        else:
+            super().__setattr__(key, value)
 
-        # TODO
-        # Check if this is a recovery
-
-        # Generate a uid
-        # TODO maybe this should be a hash of the called feature's state
-        h = hashlib.sha1(self.feature.id.encode('utf-8'))
-        h.update(str(self.start_time).encode('utf-8'))
-        if self.initiating_call:
-            h.update(self.initiating_call.uid.encode('utf-8'))
-        self.uid = h.hexdigest()[:CALLRECORD_UID_LEN]
-
+    def setup(self):
+        """ This is run to setup the call record before the actual call is
+        issued.
+        
+        Note that the contents of this method *cannot* go into init, as this
+        causes a slightly subtle but disastrous bug that leads to exponential
+        blowup in the number of CallRecords, as each time a record is accessed
+        it forks once it receives a new uuid.
+        """
+        self.start_time = dt.datetime.now()
+        self.__gen_uuid()
+        self.save()
+    
+    def conclude(self, status: CallStatus):
+        """ ...and this one tears it down
+        """
+        self.exit_status = status
+        self.stop_time = dt.datetime.now()
         self.save()
 
     def __str__(self):
-        s = self.uid[:16] + '...\n'
+        s = self.uuid[:16] + '...\n'
         for attr in CallRecord.printed_attrs:
             max_attr_len = max(map(len, CallRecord.printed_attrs))
             val = getattr(self, attr)
@@ -367,6 +394,21 @@ class CallRecord(me.Document):
             s += ' ' + messages.cstr(attr, 'italic') + ' ' * (max_attr_len - len(attr))\
                      + ' : {}\n'.format(val)
         return s
+    
+    def __gen_uuid(self):
+        """Creates a unique ID for the call record and assigned.
+        
+        Must be called after assigning a start time.
+        
+        Note that I am not using a hash function instead of the `uuid` module
+        from the standard library because we specifically want a pseudorandom
+        string with non-predictable values even in the most significant digits
+        """
+        h = hashlib.sha1(self.feature.id.encode('utf-8'))
+        h.update(str(self.start_time).encode('utf-8'))
+        if self.initiating_call:
+            h.update(self.initiating_call.uuid.encode('utf-8'))
+        self.uuid = h.hexdigest()[:CallRecord.UUID_LEN]
 
     def get_initiated_call(self, other_feature):
         # Should search tree for a matching call.
