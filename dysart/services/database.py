@@ -1,5 +1,4 @@
 import os
-import sys
 import datetime
 import platform
 import re
@@ -46,7 +45,7 @@ class Database(Service):
         """Optionally returns a port number of a running process; none if not running.
         """
         # TODO really do clean up this fragile method. Abstract away some of the repetition
-        # betwen platforms; if possible remove the dependency on `netstat`, etc.
+        # between platforms; if possible remove the dependency on `netstat`, etc.
         system = platform.system()
         if system in 'Linux, Darwin':
             p = psutil.Process(self.pid)
@@ -88,7 +87,7 @@ class Database(Service):
 
     def _start(self) -> None:
         if platform.system() in ('Darwin', 'Linux'):
-            command = f"""mongod --port {conf.config["DB_PORT"]} --fork --quiet
+            command = f"""mongod --port {conf.config["db_port"]} --fork --quiet
             --logappend --logpath {self.log_path} --dbpath {self.db_dir}
             """.split()
             self.completed_proc = subprocess.run(command, capture_output=True)
@@ -104,19 +103,16 @@ class Database(Service):
 
     def _stop(self) -> None:
         if platform.system() in ('Darwin', 'Linux'):
-            try:
-                os.kill(self.pi, signal.SIGINT)
-            except Exception:
-                pass
+            os.kill(self.pid, signal.SIGINT)
         elif platform.system() == 'Windows':
-            pass
+            raise NotImplementedError
 
     @property
     def db_dir(self) -> str:
         # TODO it might actually be a little confusing that this is a property
         return os.path.join(
-            conf.DYS_PATH,
-            conf.config['DEFAULT_DB'],
+            conf.dys_path,
+            conf.config['default_db'],
             'db'
         )
 
@@ -124,8 +120,8 @@ class Database(Service):
     def log_dir(self) -> str:
         # TODO it might actually be a little confusing that this is a property
         return os.path.join(
-            conf.DYS_PATH,
-            conf.config['DEFAULT_DB'],
+            conf.dys_path,
+            conf.config['default_db'],
             'log'
         )
 

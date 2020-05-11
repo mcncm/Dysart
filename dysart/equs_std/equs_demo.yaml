@@ -16,7 +16,7 @@ Modules:
   Hooks:
     - slack.py
     - hooks.py
-
+    - expiration.py
 
 # The features defining the dependency tree in the project.
 # These simple qubit properties will probably, in the future, be rolled
@@ -41,7 +41,8 @@ Features:
     post_hook:
       name: slack.to_users
       args: ['XXXXXXXXX']  # a Slack user ID
-
+    expiration_hook:
+      name: expiration.always_fresh
 
   # Qubit driving
   qb_rabi:
@@ -51,7 +52,9 @@ Features:
     # its class. There is not yet any "static" or "import-time" checking
     # is done correctly by the user, so you might encounter strange
     # runtime errors if you make a mistake.
-    pre_hook:
-      name: hooks.debug
     parents:
       spec: qubit_spectrum_1
+    pre_hook:
+      name: hooks.debug
+    expiration_hook:
+      name: expiration.always_fresh
